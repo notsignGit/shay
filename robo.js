@@ -32,7 +32,7 @@ function adminAction(action) {
 }
 
 const PLAYERS = [
-    { name: 'YAIR',     code: '' },
+    { name: 'SHAI',     code: '0998987654' },
     // { name: 'SHLOMI',   code: '' },
     // { name: 'MIKI',     code: '' },
     // { name: 'MIKI2',    code: '' },
@@ -58,19 +58,31 @@ const PLAYERS = [
 
 const MOVES   = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
 const DELTAS  = { UP: [0, 1], DOWN: [0, -1], LEFT: [-1, 0], RIGHT: [1, 0] };
+const OPPOSITE = { UP: 'DOWN', DOWN: 'UP', LEFT: 'RIGHT', RIGHT: 'LEFT' };
+
+function key(x, y) {
+    return `${x},${y}`;
+}
+
+function stepCoord(x, y, move) {
+    const [dx, dy] = DELTAS[move];
+    return { x: x + dx, y: y + dy };
+}
+
+function manhattan(a, b) {
+    return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
 
 // ── BFS: returns first move toward the target, or null if unreachable ─────────
 function bfsMove(sx, sy, tx, ty, obstSet, W, H) {
     if (sx === tx && sy === ty) return 'STAY';
-    const key   = (x, y) => `${x},${y}`;
-    const queue = [[sx, sy, null]];   // [x, y, firstMove]
+    const queue = [[sx, sy, null]];
     const seen  = new Set([key(sx, sy)]);
 
     while (queue.length) {
         const [x, y, first] = queue.shift();
         for (const move of MOVES) {
-            const [dx, dy] = DELTAS[move];
-            const nx = x + dx, ny = y + dy;
+            const { x: nx, y: ny } = stepCoord(x, y, move);
             if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
             const k = key(nx, ny);
             if (seen.has(k) || obstSet.has(k)) continue;
@@ -83,22 +95,108 @@ function bfsMove(sx, sy, tx, ty, obstSet, W, H) {
     return null;   // unreachable
 }
 
-/**
- * Pick the best target prize and return the first BFS move toward it.
- * Prizes are ranked by value / manhattan_distance (higher = better).
- */
-function chooseMove(robot, prizes, obstSet, W, H) {
+function chooseTarget(prizes, robot) {
+    if (!prizes.length) return null;
+
+    const clusters = prizes
+        .map(p => ({
+            p,
+            dist: manhattan(robot, p),
+            value: p.value,
+        }))
+        .sort((a, b) => a.dist - b.dist);
+
+    const nearest = clusters[0]?.dist ?? Infinity;
+    const nearby = clusters.filter(entry => entry.dist <= nearest + 2);
+
+    const totalValue = nearby.reduce((sum, entry) => sum + entry.value, 0);
+    const centroid = nearby.reduce(
+        (acc, entry) => ({
+            x: acc.x + entry.p.x,
+            y: acc.y + entry.p.y,
+        }),
+        { x: 0, y: 0 }
+    );
+
+    return {
+        x: Math.round(centroid.x / nearby.length),
+        y: Math.round(centroid.y / nearby.length),
+        value: totalValue,
+        nearby,
+    };
+}
+
+function chooseMove(robot, prizes, rivals, obstSet, W, H, lastMove) {
     if (!prizes.length) return 'STAY';
 
-    const ranked = prizes
-        .map(p => ({ p, score: p.value / (Math.abs(p.x - robot.x) + Math.abs(p.y - robot.y) + 1) }))
-        .sort((a, b) => b.score - a.score);
+    const target = chooseTarget(prizes, robot);
+    const myDist = manhattan(robot, target);
+    const rivalCloser = rivals.some(r => manhattan(r, target) < myDist);
 
-    for (const { p } of ranked) {
-        const move = bfsMove(robot.x, robot.y, p.x, p.y, obstSet, W, H);
-        if (move && move !== 'STAY') return move;
+    const move = bfsMove(robot.x, robot.y, target.x, target.y, obstSet, W, H);
+    if (!move || move === 'STAY') return 'STAY';
+
+    if (!rivalCloser) return move;
+
+    const contestMoves = getContestMoves(robot, target, rivals, obstSet, W, H, lastMove);
+    if (contestMoves.length) return contestMoves[0].move;
+    return move;
+}
+
+function buildBlockedSet(msg, myName) {
+    const blocked = new Set();
+
+    for (const [x, y] of (msg.obstacles || [])) {
+        blocked.add(key(x, y));
     }
-    return 'STAY';
+
+    for (const robot of (msg.robots || [])) {
+        if (robot.name === myName) continue;
+        blocked.add(key(robot.x, robot.y));
+    }
+
+    return blocked;
+}
+
+function buildRivals(msg, myName) {
+    return (msg.robots || [])
+        .filter(robot => robot.name !== myName)
+        .map(robot => ({ x: robot.x, y: robot.y, name: robot.name }));
+}
+
+function getContestMoves(robot, prize, rivals, obstSet, W, H, lastMove) {
+    const rivalSet = new Set(rivals.map(r => key(r.x, r.y)));
+
+    return MOVES
+        .map(move => {
+            const next = stepCoord(robot.x, robot.y, move);
+            const blocked = next.x < 0 || next.x >= W || next.y < 0 || next.y >= H || obstSet.has(key(next.x, next.y));
+            const nearRival = rivals.some(r => Math.abs(r.x - next.x) + Math.abs(r.y - next.y) === 1);
+            const score = manhattan(next, prize) + (nearRival ? 2 : 0);
+            const reversePenalty = move === OPPOSITE[lastMove] ? 1 : 0;
+
+            return { move, next, blocked, score, reversePenalty };
+        })
+        .filter(candidate => !candidate.blocked)
+        .sort((a, b) => a.reversePenalty - b.reversePenalty || a.score - b.score);
+}
+
+function pickAlternativeMove(robot, prizes, rivals, obstSet, W, H, lastMove) {
+    const feasible = MOVES
+        .map(move => {
+            const next = stepCoord(robot.x, robot.y, move);
+            const blocked = obstSet.has(key(next.x, next.y)) || next.x < 0 || next.x >= W || next.y < 0 || next.y >= H;
+            const nearRival = rivals.some(r => Math.abs(r.x - next.x) + Math.abs(r.y - next.y) === 1);
+            const bestPrizeDist = prizes.reduce((best, p) => Math.min(best, manhattan(next, p)), Infinity);
+            const reversePenalty = move === OPPOSITE[lastMove] ? 1 : 0;
+
+            return { move, next, blocked, bestPrizeDist, reversePenalty, nearRival };
+        })
+        .filter(candidate => !candidate.blocked)
+        .sort((a, b) => a.reversePenalty - b.reversePenalty || a.nearRival - b.nearRival || a.bestPrizeDist - b.bestPrizeDist);
+
+    if (!feasible.length) return 'STAY';
+    return feasible[0].move;
 }
 
 // ── HTTP GET ──────────────────────────────────────────────────────────────────
@@ -123,6 +221,9 @@ function connectPlayer(player) {
         let alive   = true;
         let obstSet = null;
         let gridW   = 38, gridH = 25;
+        let lastMove = null;
+        let lastPos  = null;
+        let noProgressSteps = 0;
 
         const close = () => { alive = false; try { ws.close(); } catch {} resolve(); };
         const safety = setTimeout(close, 10 * 60 * 1000);
@@ -146,10 +247,32 @@ function connectPlayer(player) {
                 if (!robot) return;
                 gridW   = msg.grid?.width  || 38;
                 gridH   = msg.grid?.height || 25;
-                if (msg.obstacles) obstSet = new Set(msg.obstacles.map(([x, y]) => `${x},${y}`));
-                const move = chooseMove(robot, msg.prizes || [], obstSet || new Set(), gridW, gridH);
-                ws.send(JSON.stringify({ type: 'cmd', move }));
-                cmdSent++;
+                obstSet = buildBlockedSet(msg, myName);
+                const rivals = buildRivals(msg, myName);
+
+                if (lastPos && robot.x === lastPos.x && robot.y === lastPos.y) {
+                    noProgressSteps++;
+                } else {
+                    noProgressSteps = 0;
+                }
+
+                let move = chooseMove(robot, msg.prizes || [], rivals, obstSet || new Set(), gridW, gridH, lastMove);
+                let burstCount = 2;
+                if (move === 'STAY' || noProgressSteps >= 2 || (lastMove === move && lastPos && robot.x === lastPos.x && robot.y === lastPos.y)) {
+                    move = pickAlternativeMove(robot, msg.prizes || [], rivals, obstSet || new Set(), gridW, gridH, lastMove);
+                    burstCount = 1;
+                }
+
+                if (rivals.some(r => Math.abs(r.x - robot.x) + Math.abs(r.y - robot.y) <= 2)) {
+                    burstCount = 1;
+                }
+
+                for (let i = 0; i < burstCount; i++) {
+                    ws.send(JSON.stringify({ type: 'cmd', move }));
+                }
+                cmdSent += burstCount;
+                lastMove = move;
+                lastPos = { x: robot.x, y: robot.y };
             }
         });
 
